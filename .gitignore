@@ -28,7 +28,7 @@ env/
 
 # Datasets and Images
 # (It's generally a bad idea to upload large image datasets to GitHub)
-data/
+# data/
 
 # Model outputs, weights, and results
 results/
