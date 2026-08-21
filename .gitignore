@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Datasets and Images
+# (It's generally a bad idea to upload large image datasets to GitHub)
+data/
+
+# Model outputs, weights, and results
+results/
+results_dual/
+*.keras
+*.h5
+*.hdf5
+*.tflite
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
