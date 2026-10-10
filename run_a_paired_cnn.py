@@ -185,14 +185,15 @@ def run_cache_training(cache_dir, cache_name):
         print(f"  Early Stop  : {len(final_es_idx)} images")
         print(f"  OOF Test    : {len(final_test_idx)} images")
         
-        train_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_train_idx], afi_all[final_train_idx], labels[final_train_idx]))
-        train_ds = train_ds.shuffle(len(final_train_idx)).map(augment_fn, num_parallel_calls=tf.data.AUTOTUNE).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-        
-        es_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_es_idx], afi_all[final_es_idx], labels[final_es_idx]))
-        es_ds = es_ds.map(lambda w,a,l: ((w,a), l)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-        
-        test_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_test_idx], afi_all[final_test_idx], labels[final_test_idx]))
-        test_ds = test_ds.map(lambda w,a,l: ((w,a), l)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        with tf.device('/CPU:0'):
+            train_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_train_idx], afi_all[final_train_idx], labels[final_train_idx]))
+            train_ds = train_ds.shuffle(len(final_train_idx)).map(augment_fn, num_parallel_calls=tf.data.AUTOTUNE).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+            
+            es_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_es_idx], afi_all[final_es_idx], labels[final_es_idx]))
+            es_ds = es_ds.map(lambda w,a,l: ((w,a), l)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+            
+            test_ds = tf.data.Dataset.from_tensor_slices((wli_all[final_test_idx], afi_all[final_test_idx], labels[final_test_idx]))
+            test_ds = test_ds.map(lambda w,a,l: ((w,a), l)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
         
         model = build_dual_stream_cnn()
         
