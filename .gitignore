@@ -27,16 +27,20 @@ env/
 .env
 
 # Datasets and Images
-# (It's generally a bad idea to upload large image datasets to GitHub)
-# data/
+data/
+Data/
+data_cached*/
+cache_dryrun/
 
 # Model outputs, weights, and results
 results/
-results_dual/
+results_dual*/
 *.keras
 *.h5
 *.hdf5
 *.tflite
+*.csv
+*.pkl
 
 # IDEs and OS files
 .vscode/

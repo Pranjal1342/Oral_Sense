@@ -25,14 +25,30 @@ import matplotlib.pyplot as plt
 DATA_DIR        = "data"
 IMG_SIZE        = (96, 96)        
 N_META_FEATURES = 4               
-BATCH_SIZE      = 8               
+BATCH_SIZE      = 32               
 N_FOLDS         = 5
-EPOCHS          = 40
-EARLY_STOP_PAT  = 8
+EPOCHS          = 100
+EARLY_STOP_PAT  = 12
 L2_PENALTY      = 1e-4
 DROPOUT_RATE    = 0.3
-OUTPUT_DIR      = "results_dual"
+OUTPUT_DIR      = "results_dual_v6"
 SEED            = 42
+
+# Data is now manually oversampled to 1:1 (8878 cancer / 8878 non_cancer).
+# Training is balanced — class weights are neutral.
+# Logit offset -1.225 is STILL applied post-training to recalibrate to the
+# real-world 3.4:1 prior (balanced training ≠ balanced real world).
+CLINICAL_CLASS_WEIGHTS = {
+    0: 1.0,   # Healthy   (balanced — no penalty needed)
+    1: 1.0,   # Malignant (balanced — no penalty needed)
+}
+LOGIT_OFFSET    = 1.225   # ln(3.4) — real-world prior correction, unchanged
+
+# Real patient metadata CSV
+METADATA_CSV    = os.path.join(DATA_DIR, "image_metadata_mapping.csv")
+
+# Oversampling no longer needed — data is already 1:1 balanced
+USE_OVERSAMPLING = True
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 tf.random.set_seed(SEED)
@@ -52,6 +68,8 @@ def load_file_labels(data_dir):
             raise FileNotFoundError(f"Missing dual-stream directories!\nPlease create: {wli_dir} and {afi_dir}")
             
         for fname in os.listdir(wli_dir):
+            if fname.lower().startswith("cancer_aug_"):
+                continue  # Prevent fold leakage from augmented copies
             if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
                 wli_path = os.path.join(wli_dir, fname)
                 basename = os.path.splitext(fname)[0]
@@ -81,6 +99,7 @@ def load_file_labels(data_dir):
     return np.array(filepaths_wli), np.array(filepaths_afi), np.array(labels)
 
 def generate_synthetic_metadata(n_samples, labels, seed=SEED):
+    """Fallback: generate synthetic metadata to simulate clinical priors."""
     rng = np.random.default_rng(seed)
     meta = np.zeros((n_samples, N_META_FEATURES), dtype=np.float32)
     for i, label in enumerate(labels):
@@ -90,6 +109,85 @@ def generate_synthetic_metadata(n_samples, labels, seed=SEED):
             age, smoking, betel, alcohol = rng.integers(25, 65), rng.choice([0, 1], p=[0.6, 0.4]), rng.choice([0, 1, 2], p=[0.5, 0.35, 0.15]), rng.choice([0, 1, 2], p=[0.5, 0.35, 0.15])
         meta[i] = [(age - 25) / 50.0, float(smoking), betel / 2.0, alcohol / 2.0]
     return meta
+
+
+def load_real_metadata(filepaths_wli, csv_path):
+    """
+    Load real patient metadata from image_metadata_mapping.csv.
+
+    CSV columns used: WLI_Filename, Age, Smoking, Chewing_Betel_Quid, Alcohol
+    Encoded to N_META_FEATURES=4 floats:
+      [0] age_norm  = (Age - 18) / 82  -> [0, 1]
+      [1] smoking   = 1 if Yes else 0
+      [2] betel     = 1 if Yes else 0
+      [3] alcohol   = 1 if Yes else 0
+
+    Imputation strategy:
+      - Exact CSV match          -> real values
+      - cancer_aug_* files       -> cancer-patient population medians from CSV
+      - non_cancer / unmatched   -> [median_age, 0.5, 0.5, 0.5]
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
+    df["WLI_Filename"] = df["WLI_Filename"].str.strip()
+
+    def yn(val):
+        return 1.0 if str(val).strip().lower() == "yes" else 0.0
+
+    # Encode all CSV rows
+    df["age_norm"] = pd.to_numeric(df["Age"], errors="coerce")
+    df["age_norm"] = ((df["age_norm"] - 18.0) / 82.0).clip(0.0, 1.0)
+    df["smoking_enc"] = df["Smoking"].apply(yn)
+    df["betel_enc"]   = df["Chewing_Betel_Quid"].apply(yn)
+    df["alcohol_enc"] = df["Alcohol"].apply(yn)
+
+    # Cancer-patient population medians (for augmented copies)
+    cancer_medians = [
+        float(df["age_norm"].median()),
+        float(df["smoking_enc"].mean()),    # mean of 0/1 = rate
+        float(df["betel_enc"].mean()),
+        float(df["alcohol_enc"].mean()),
+    ]
+    # General population median (for non-cancer unmatched)
+    general_impute = [float(df["age_norm"].median()), 0.5, 0.5, 0.5]
+
+    lookup = df.set_index("WLI_Filename")
+    meta   = np.zeros((len(filepaths_wli), N_META_FEATURES), dtype=np.float32)
+
+    matched = aug_imputed = general_imputed = 0
+
+    for i, fp in enumerate(filepaths_wli):
+        bname = os.path.basename(fp)
+
+        if bname in lookup.index:
+            # Exact match in CSV
+            row = lookup.loc[bname]
+            try:
+                age_norm = float(np.clip((float(row["Age"]) - 18.0) / 82.0, 0.0, 1.0))
+            except (ValueError, TypeError):
+                age_norm = cancer_medians[0]
+            meta[i] = [age_norm, yn(row["Smoking"]),
+                       yn(row["Chewing_Betel_Quid"]), yn(row["Alcohol"])]
+            matched += 1
+
+        elif bname.startswith("cancer_aug_"):
+            # Oversampled cancer copy — use cancer population medians
+            meta[i] = cancer_medians
+            aug_imputed += 1
+
+        else:
+            # Non-cancer or unmatched original — maximum uncertainty
+            meta[i] = general_impute
+            general_imputed += 1
+
+    print(f"  Metadata loaded:")
+    print(f"    Exact CSV match   : {matched:>5}")
+    print(f"    cancer_aug_* fill : {aug_imputed:>5}  (cancer population medians)")
+    print(f"    General imputation: {general_imputed:>5}  (median age, 0.5/0.5/0.5)")
+    return meta
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,9 +271,71 @@ def make_dual_dataset(filepaths_wli, filepaths_afi, labels, metadata, augment):
     )
 
     if augment:
-        ds = ds.shuffle(buffer_size=len(labels), seed=SEED)
+        ds = ds.shuffle(buffer_size=min(2000, len(labels)), seed=SEED)
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
+
+
+def make_balanced_dataset(filepaths_wli, filepaths_afi, labels, metadata):
+    """
+    Balances a 3.4:1 class-imbalanced paired dataset using tf.data pipeline oversampling.
+
+    Strategy:
+      - Split into two class-specific datasets (cancer / non_cancer)
+      - Repeat the minority class infinitely with augmentation ON
+        so every repeat gets a different random flip/rotation/contrast
+      - sample_from_datasets draws 50% from each class per batch
+      - steps_per_epoch = (2 * majority_count) // BATCH_SIZE caps the epoch
+        so training doesn't run forever
+
+    Returns: (balanced_ds, steps_per_epoch)
+    """
+    cancer_idx     = np.where(labels == 1)[0]
+    non_cancer_idx = np.where(labels == 0)[0]
+
+    def _make_class_ds(idx, augment, repeat=False):
+        wli_f  = filepaths_wli[idx]
+        afi_f  = filepaths_afi[idx]
+        lbl    = labels[idx]
+        meta   = metadata[idx]
+
+        path_ds = tf.data.Dataset.from_tensor_slices((wli_f, afi_f, lbl))
+        decoded = path_ds.map(
+            lambda w, a, l: decode_paired_images(w, a, l, augment),
+            num_parallel_calls=tf.data.AUTOTUNE
+        )
+        meta_ds = tf.data.Dataset.from_tensor_slices(meta.astype(np.float32))
+        lbl_ds  = tf.data.Dataset.from_tensor_slices(lbl.astype(np.float32))
+
+        ds = tf.data.Dataset.zip((decoded, meta_ds, lbl_ds))
+        ds = ds.map(lambda imgs, m, l: ((imgs[0], imgs[1], m), l))
+        if repeat:
+            ds = ds.shuffle(buffer_size=len(idx), seed=SEED, reshuffle_each_iteration=True)
+            ds = ds.repeat()   # infinite — fresh shuffle + augmentation every repeat
+        return ds
+
+    cancer_ds     = _make_class_ds(cancer_idx,     augment=True,  repeat=True)
+    non_cancer_ds = _make_class_ds(non_cancer_idx, augment=True,  repeat=True)
+
+    # Draw 50% from each class every batch
+    balanced_ds = tf.data.Dataset.sample_from_datasets(
+        [cancer_ds, non_cancer_ds],
+        weights=[0.5, 0.5],
+        seed=SEED,
+        stop_on_empty_dataset=False
+    )
+    balanced_ds = balanced_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+    # Cap each epoch: 2 × majority so both classes are seen roughly once
+    majority_count = max(len(cancer_idx), len(non_cancer_idx))
+    steps_per_epoch = (2 * majority_count) // BATCH_SIZE
+
+    print(f"   Oversampling active:")
+    print(f"     cancer pairs     : {len(cancer_idx)}")
+    print(f"     non-cancer pairs : {len(non_cancer_idx)} (repeated w/ fresh augmentation)")
+    print(f"     steps/epoch      : {steps_per_epoch}")
+
+    return balanced_ds, steps_per_epoch
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. DUAL-STREAM MODEL ARCHITECTURE
@@ -253,11 +413,100 @@ def build_dual_stream_cnn():
 if __name__ == "__main__":
     filepaths_wli, filepaths_afi, labels = load_file_labels(DATA_DIR)
     
+    # ── UNDERSAMPLING ──────────────────────────────────────────────────────────
+    # Reduce healthy (0) count to exactly match cancer (1) count
+    cancer_idx = np.where(labels == 1)[0]
+    non_cancer_idx = np.where(labels == 0)[0]
+    if len(non_cancer_idx) > len(cancer_idx):
+        print(f"Undersampling healthy images from {len(non_cancer_idx)} to {len(cancer_idx)}")
+        np.random.shuffle(non_cancer_idx)
+        non_cancer_idx = non_cancer_idx[:len(cancer_idx)]
+    
+    keep_idx = np.concatenate([cancer_idx, non_cancer_idx])
+    np.random.shuffle(keep_idx)
+    filepaths_wli = filepaths_wli[keep_idx]
+    filepaths_afi = filepaths_afi[keep_idx]
+    labels = labels[keep_idx]
+    # ──────────────────────────────────────────────────────────────────────────
     if len(labels) == 0:
         print("No paired images found. Please organize your folders properly.")
         exit(1)
-        
-    metadata = generate_synthetic_metadata(len(labels), labels)
+
+    # ── Corrupt-file validation (with cache) ────────────────────────────────
+    # First run: fully decodes every image with PIL (slow, ~3-5 min for 8K pairs).
+    # Saves valid pair paths to a cache file.
+    # Subsequent runs: loads cache instantly — no rescan needed.
+    from PIL import Image, UnidentifiedImageError
+    import warnings, json
+    from tqdm import tqdm
+
+    CACHE_FILE = os.path.join(OUTPUT_DIR, "valid_pairs_cache.json")
+
+    def _is_valid(path):
+        # TF decode_image supports only these formats
+        TF_OK = {"JPEG", "PNG", "GIF", "BMP", "MPO"}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with Image.open(path) as im:
+                    im.load()
+                    if im.format not in TF_OK:
+                        return False   # e.g. WebP, TIFF, HEIC — TF will crash
+            return True
+        except Exception:
+            return False
+
+
+    # Check if cache exists and covers the same set of WLI files
+    cache_hit = False
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE) as f:
+            cache = json.load(f)
+        cached_wli = set(cache.get("wli", []))
+        current_wli = set(filepaths_wli.tolist())
+        if cached_wli == current_wli:
+            valid_wli = np.array(cache["valid_wli"])
+            valid_afi = np.array(cache["valid_afi"])
+            valid_lbl = np.array(cache["valid_labels"])
+            print(f"  Loaded valid-pairs cache ({len(valid_wli)} pairs). Delete {CACHE_FILE} to rescan.")
+            cache_hit = True
+
+    if not cache_hit:
+        print(f"  Scanning {len(filepaths_wli)} pairs for corrupt images (runs once, then cached)...")
+        valid_wli_list, valid_afi_list, valid_lbl_list = [], [], []
+        removed = 0
+        for wli_p, afi_p, lbl in tqdm(zip(filepaths_wli, filepaths_afi, labels),
+                                       total=len(labels), desc="Validating"):
+            if _is_valid(wli_p) and _is_valid(afi_p):
+                valid_wli_list.append(wli_p)
+                valid_afi_list.append(afi_p)
+                valid_lbl_list.append(int(lbl))
+            else:
+                removed += 1
+        valid_wli = np.array(valid_wli_list)
+        valid_afi = np.array(valid_afi_list)
+        valid_lbl = np.array(valid_lbl_list)
+        print(f"  {removed} corrupt pair(s) removed. {len(valid_wli)} clean pairs remaining.")
+        # Save cache
+        with open(CACHE_FILE, "w") as f:
+            json.dump({"wli": filepaths_wli.tolist(),
+                       "valid_wli": valid_wli.tolist(),
+                       "valid_afi": valid_afi.tolist(),
+                       "valid_labels": valid_lbl.tolist()}, f)
+        print(f"  Cache saved to {CACHE_FILE}\n")
+
+    filepaths_wli = valid_wli
+    filepaths_afi = valid_afi
+    labels        = valid_lbl
+    # ────────────────────────────────────────────────────────────────────────
+
+
+    # Load real patient metadata from CSV (imputes missing entries)
+    if os.path.exists(METADATA_CSV):
+        metadata = load_real_metadata(filepaths_wli, METADATA_CSV)
+    else:
+        print(f"  Warning: {METADATA_CSV} not found — using synthetic metadata")
+        metadata = generate_synthetic_metadata(len(labels), labels)
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     fold_results = []
     roc_data = []
@@ -267,18 +516,61 @@ if __name__ == "__main__":
     for fold_idx, (train_idx, val_idx) in enumerate(skf.split(filepaths_wli, labels)):
         print(f"{'='*60}\nFold {fold_idx + 1}/{N_FOLDS}\n{'='*60}")
         
-        train_ds = make_dual_dataset(filepaths_wli[train_idx], filepaths_afi[train_idx], labels[train_idx], metadata[train_idx], augment=True)
-        val_ds = make_dual_dataset(filepaths_wli[val_idx], filepaths_afi[val_idx], labels[val_idx], metadata[val_idx], augment=False)
+        if USE_OVERSAMPLING:
+            train_ds, steps_per_epoch = make_balanced_dataset(
+                filepaths_wli[train_idx], filepaths_afi[train_idx],
+                labels[train_idx], metadata[train_idx]
+            )
+            # Class weights neutral — balance is handled by pipeline sampling
+            fold_class_weights = {0: 1.0, 1: 1.0}
+        else:
+            train_ds = make_dual_dataset(
+                filepaths_wli[train_idx], filepaths_afi[train_idx],
+                labels[train_idx], metadata[train_idx], augment=True
+            )
+            steps_per_epoch  = None   # let Keras infer from dataset length
+            fold_class_weights = CLINICAL_CLASS_WEIGHTS
+
+        val_ds = make_dual_dataset(
+            filepaths_wli[val_idx], filepaths_afi[val_idx],
+            labels[val_idx], metadata[val_idx], augment=False
+        )
         
         model = build_dual_stream_cnn()
-        model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy"])
-        
+
+        # ── Cosine Decay LR: starts at 1e-3, decays smoothly to 1e-6 ──
+        # steps_per_epoch may be None (non-oversampling path); fall back to
+        # a rough estimate based on dataset size and batch size.
+        _steps = steps_per_epoch or max(1, len(train_idx) // BATCH_SIZE)
+        cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=2e-4,
+            decay_steps=EPOCHS * _steps,
+            alpha=1e-6   # minimum LR at end of schedule
+        )
+        # ── Label Smoothing: prevents overconfident hard-0/hard-1 outputs ──
+        smoothed_loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=0.02)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(cosine_lr),
+            loss=smoothed_loss,
+            metrics=["accuracy"]
+        )
+
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PAT, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6)
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=EARLY_STOP_PAT, restore_best_weights=True
+            ),
         ]
         
-        model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=callbacks, verbose=1)
+        model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            callbacks=callbacks,
+            class_weight=fold_class_weights,
+            verbose=1
+        )
         
         y_val = labels[val_idx]
         y_prob = model.predict(val_ds, verbose=0).ravel()
@@ -303,10 +595,83 @@ if __name__ == "__main__":
         print(f"  {col:<14}: {df[col].mean():.3f} ± {df[col].std():.3f}")
     print(f"  params       : {n_params:,}")
 
-    # ── Save model ──
+    # ── Save uncalibrated model (pre-recalibration checkpoint) ──
     model_path = os.path.join(OUTPUT_DIR, "dual_stream_model.keras")
     model.save(model_path)
-    print(f"\n✅ Model saved to {model_path}")
+    print(f"\n✅ Uncalibrated model saved to {model_path}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP A: Elkan prior-correction — recalibrate final Dense(1) bias
+    # Rationale: class_weight training calibrates p(y=1) for a balanced prior.
+    # Subtracting ln(w1/w0) = ln(3.4) = 1.225 from the bias restores calibration
+    # to the true clinical 3.4:1 prior WITHOUT retraining.
+    # This is baked in before TFLite export so ESP32-S3 needs zero extra math.
+    # ─────────────────────────────────────────────────────────────────────────
+    output_layer = model.get_layer("risk_score")  # named Dense(1, sigmoid)
+    weights, biases = output_layer.get_weights()
+    old_bias = float(biases[0])
+    biases[0] = biases[0] - LOGIT_OFFSET
+    output_layer.set_weights([weights, biases])
+    print(f"\n🔧 Logit recalibration applied:")
+    print(f"   bias before : {old_bias:.6f}")
+    print(f"   offset      : -{LOGIT_OFFSET}  [ln({CLINICAL_CLASS_WEIGHTS[1]}/{CLINICAL_CLASS_WEIGHTS[0]:.4f}) = ln(3.4)]")
+    print(f"   bias after  : {float(biases[0]):.6f}")
+
+    # Save calibrated model separately
+    calibrated_path = os.path.join(OUTPUT_DIR, "dual_stream_calibrated.keras")
+    model.save(calibrated_path)
+    print(f"✅ Calibrated model saved to {calibrated_path}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP B: INT8 TFLite export (from calibrated model)
+    # representative_data_gen feeds real training images from the last fold
+    # so the quantiser can compute per-layer activation ranges.
+    # ─────────────────────────────────────────────────────────────────────────
+    # Build a small representative dataset from last fold training indices
+    _rep_wli  = filepaths_wli[train_idx[:30]]
+    _rep_afi  = filepaths_afi[train_idx[:30]]
+    _rep_meta = metadata[train_idx[:30]]
+
+    def representative_data_gen():
+        """Yields 30 real samples for INT8 activation range calibration."""
+        for i in range(len(_rep_wli)):
+            # Decode WLI (RGB)
+            wli_raw = tf.io.read_file(_rep_wli[i])
+            wli_img = tf.image.decode_image(wli_raw, channels=3, expand_animations=False)
+            wli_img = tf.image.resize(wli_img, IMG_SIZE)
+            wli_img = tf.cast(wli_img, tf.float32) / 127.5 - 1.0
+            wli_img = tf.expand_dims(wli_img, 0)   # (1, 96, 96, 3)
+
+            # Decode AFI (grayscale)
+            afi_raw = tf.io.read_file(_rep_afi[i])
+            afi_img = tf.image.decode_image(afi_raw, channels=1, expand_animations=False)
+            afi_img = tf.image.resize(afi_img, IMG_SIZE)
+            afi_img = tf.cast(afi_img, tf.float32) / 127.5 - 1.0
+            afi_img = tf.expand_dims(afi_img, 0)   # (1, 96, 96, 1)
+
+            meta = tf.expand_dims(_rep_meta[i], 0).numpy()  # (1, 4)
+
+            # Yield as list matching model input order: [wli, afi, meta]
+            yield [wli_img.numpy(), afi_img.numpy(), meta]
+
+    print("\n⚙️  Converting to INT8 TFLite...")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_data_gen
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type  = tf.int8
+    converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+
+    tflite_path = os.path.join(OUTPUT_DIR, "oral_sense_v2_calibrated.tflite")
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
+
+    tflite_kb = len(tflite_model) / 1024
+    print(f"✅ INT8 TFLite saved: {tflite_path}")
+    print(f"   Size: {tflite_kb:.1f} KB  ({tflite_kb/1024:.3f} MB)")
+    print(f"   ESP32-S3 Flash budget: 8192 KB  →  {8192 - tflite_kb:.0f} KB remaining")
 
     # ── Summary CSV ──
     csv_path = os.path.join(OUTPUT_DIR, "summary_metrics.csv")

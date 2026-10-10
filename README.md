@@ -2,61 +2,52 @@
 
 This repository contains a machine learning pipeline for screening oral cancer using Autofluorescence Imaging (AFI), White Light Imaging (WLI), and clinical metadata. The models are specifically designed and constrained for edge deployment on low-resource microcontrollers like the **ESP32-S3**.
 
+## Recent Updates: Unbiased Validation Pipeline
+We recently overhauled the pipeline to strictly validate whether the Dual-Stream CNN is learning genuine biology or accidentally relying on camera/crop cues (a known issue in unconstrained medical datasets).
+
+### The Evaluation Scripts
+1. **`build_cache.py`**:
+   * Reads raw RGB images and dynamically generates "pseudo-AFI" using CLAHE and contrast ratios.
+   * Extracts two strictly controlled image crops per file: a **Region of Interest (ROI)** crop based on Otsu saturation, and a fallback **CENTER** crop.
+   * Builds un-augmented `96x96` caches mapped by camera EXIF and quantization tables to ensure strict cluster-level data separation.
+2. **`run_a_paired_cnn.py` (Run A)**:
+   * The definitive, unbiased training script.
+   * **No Metadata Leakage**: Clinical metadata has been completely stripped to evaluate pure image biology.
+   * **Perfect Class Balance**: Forces a 1:1 balance in every single training fold by dynamically subsampling the Healthy class to match the Cancer class.
+   * **Dynamic Augmentation**: Applies real-time GPU-based random flips, rotations, and contrast jittering to the 11,480 base images, preventing data leakage across folds.
+3. **`compute_drop_table.py`**:
+   * Evaluates the statistical difference between the ROI cache predictions and the CENTER cache predictions.
+   * Uses a rigorous **Paired Group-Bootstrap** (N=1000 resamples over 3 random seeds) to compute the 95% Confidence Interval. 
+   * Definitively tests if the ROI provides statistically significant biological signal over a dumb center crop.
+
+*Note: `oral_cancer_dual_stream.py` is preserved in the repository as a historical reference of the original V2 architecture.*
+
 ## Project Context
 - **Hardware Target**: ESP32-S3 (240MHz, 8MB Flash, 8MB PSRAM)
-- **Input**: 96×96 images + 4D patient metadata (Age, Smoking, Betel Chewing, Alcohol)
+- **Input**: 96×96 images 
 - **Target Constraints**: INT8 TFLite model < 1MB, <200ms inference, offline execution
 - **Evaluation**: 5-Fold Stratified Cross-Validation (suitable for small medical datasets)
 
-## Repository Structure
-
-- `oral_cancer_comparison.py`: **Version 1 (V1)** — Single-stream pipeline comparing a custom lightweight AFI-CNN against standard baselines (MobileNetV1, MobileNetV2, EfficientNetB0, and ViT-B/16). It uses grayscale AFI images and clinical metadata.
-- `oral_cancer_dual_stream.py`: **Version 2 (V2)** — Our second version of comparison. It introduces a dual-stream architecture that fuses White Light Imaging (RGB), Autofluorescence Imaging (Grayscale), and clinical metadata.
-- `requirements.txt`: Required Python dependencies.
-
-## Model Architectures
-
-### 1. Custom AFI-CNN (Primary Edge Candidate)
-Designed from scratch for 96×96 grayscale AFI input and metadata fusion. It uses depthwise separable convolutions to drastically reduce FLOPs, keeping the INT8 quantized model size around **~0.2 MB**.
-
-### 2. Dual-Stream CNN (Version 2 Comparison)
-As our second version of model comparison, this architecture fuses three modalities:
-- WLI Branch (RGB Image)
-- AFI Branch (Grayscale Image)
-- Metadata Branch (Clinical Features)
-All three embeddings are concatenated and passed through dense layers to predict oral cancer risk.
-
-### 3. Baselines Evaluated
-- **MobileNetV1 (α=0.5)**: Baseline edge candidate (~0.45 MB INT8).
-- **MobileNetV2**: Stronger edge candidate (~1.4 MB INT8).
-- **EfficientNetB0**: Upper-bound edge reference (~4.0 MB INT8).
-- **ViT-B/16**: Accuracy ceiling reference only. At ~86 MB INT8, it is physically impossible to deploy on the ESP32-S3.
-
 ## Data Layout Requirements
 
-To train the models, you must organize your image data into the following folder structure:
+To build the caches, you must organize your original, un-augmented base WLI images into the following folder structure:
 
 ```
 data/
   wli/
-    cancer/        ← WLI images of suspicious/malignant lesions
-    non_cancer/    ← WLI images of healthy tissue
-  afi/
-    cancer/        ← AFI images of suspicious/malignant lesions
-    non_cancer/    ← AFI images of healthy tissue
+    cancer/        ← Raw WLI images of suspicious/malignant lesions
+    non_cancer/    ← Raw WLI images of healthy tissue
 ```
 
-*Note: For the single-stream `oral_cancer_comparison.py`, you can place your images directly into `data/cancer/` and `data/non_cancer/`.*
+*Note: `build_cache.py` will automatically filter out any pre-augmented offline images (e.g. `cancer_aug_*.jpg`) to prevent data leakage during cross-validation.*
 
 ## Setup & Usage
 
-### 1. Create a Conda Environment & Install Dependencies
-It is highly recommended to use Python 3.9 - 3.11. TensorFlow 2.13.1 is required to remain compatible with Keras 2 (needed for the ViT implementation).
-
-Using [Conda](https://docs.conda.io/en/latest/) is the recommended way to manage dependencies. Run the following commands in your terminal to set up and activate the environment:
+### 1. Create a Conda Environment
+Using [Conda](https://docs.conda.io/en/latest/) is the recommended way to manage dependencies.
 
 ```bash
-# Create a new conda environment named 'afi-screening' with Python 3.10
+# Create a new conda environment
 conda create -n afi-screening python=3.10 -y
 
 # Activate the environment
@@ -66,23 +57,27 @@ conda activate afi-screening
 pip install -r requirements.txt
 ```
 
-### 2. Run the Comparison Pipeline
-Trains and compares the single-stream Custom AFI-CNN against baseline architectures.
+### 2. Build the ROI and Center Caches
+Generate the `96x96` caches and the `cache_manifest.csv` cluster mapping:
 ```bash
-python oral_cancer_comparison.py
+python build_cache.py
 ```
-*Outputs (saved to `results/`): Summary metrics CSV, comparison bar charts, ROC curves, and Parameters vs AUC scatter plot.*
 
-### 3. Run the Dual-Stream Pipeline
-Trains the dual-stream model on paired WLI and AFI images.
+### 3. Run the Dual-Stream CNN
+Train the 5-fold Stratified CNN on both caches natively on your GPU:
 ```bash
-python oral_cancer_dual_stream.py
+python run_a_paired_cnn.py
 ```
-*Outputs (saved to `results_dual/`): The trained `.keras` model, summary metrics, and performance plots.*
+*Outputs: `oof_ROI.csv` and `oof_CENTER.csv`.*
+
+### 4. Evaluate the Decision Rule
+Run the paired bootstrap script to test statistical significance:
+```bash
+python compute_drop_table.py
+```
 
 ## Clinical Metrics
-Both scripts optimize for and report on metrics critical for medical screening:
+The pipeline optimizes for and reports on metrics critical for medical screening:
 - **Sensitivity (Recall)**: Prioritized over specificity. Missing a true cancer case (False Negative) is heavily penalized.
 - **Specificity**
-- **ROC-AUC**
-- **Youden's J Statistic**: Used to automatically calibrate the optimal classification threshold.
+- **ROC-AUC (Area Under Curve)**: Inherently immune to class imbalance during OOF test evaluation.
